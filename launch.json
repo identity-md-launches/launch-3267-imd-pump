@@ -1,0 +1,33 @@
+{
+  "kind": "custom_token",
+  "token": {
+    "contract": "IMDPumpToken",
+    "name": "IMD PUMP",
+    "symbol": "IMDPUMP",
+    "decimals": 18,
+    "constructorArgs": [],
+    "totalSupply": "1000000000000000000000000000"
+  },
+  "contracts": [
+    {
+      "contract": "IMDPumpRevenueSplitter",
+      "constructorArgs": [
+        "$requester",
+        "$requester",
+        "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "economics": {
+    "poolBps": 8800,
+    "initialMarketCapWei": "2500000000000000000000",
+    "remainderTo": "0x83027ad9d0d5374335086c539dadd1db983441b0"
+  },
+  "notes": "IMDPumpToken mints 1,000,000,000 IMDPUMP with 18 decimals once to its deployer. It has no transfer tax, owner or further minting; holders can burn their own tokens. IMDPumpRevenueSplitter is owned by the requester, whose address initially receives the developer, treasury, operations and NFT worker payouts. The platform operator determines eligible net platform revenue off chain, converts it to IMD and deposits that IMD into the splitter. The initial allocation is 20% for IMD burns, 15% for developer IMD rewards, 25% for the ecosystem treasury, 20% for development and operations and 20% for NFT worker rewards. Rounding dust goes to the treasury. The burn share accumulates as pendingBurn until the owner sets a burnSink. Burn execution transfers IMD to that configured destination and emits an event. The owner can change allocations, recipients and the burn sink at any time; the proposed three-month sustainability review is an operational step. The splitter receives no IMDPUMP supply at launch. pool.initialPrice records provenance only; the deployer derives the opening price from economics.initialMarketCapWei and token.totalSupply."
+}
