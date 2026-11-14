@@ -121,22 +121,32 @@ contract IMDPumpRevenuePropertiesTest is Test {
         (uint256 burnShare, uint256 developerShare,,,) = splitter.previewDistribution();
         assertEq(burnShare, 0);
         assertEq(developerShare, 50);
+        // Naming the sink first settles the 50 waiting under the all-developer split; the
+        // 20 accrued while no sink existed stays owed until it is flushed.
         _setSink(splitter);
-        vm.prank(stranger);
-        assertEq(splitter.distribute(), 50);
-        assertEq(imd.balanceOf(destinations[0]), 20);
         assertEq(imd.balanceOf(destinations[1]), 65);
         assertEq(splitter.totalDistributed(), 150);
+        assertEq(splitter.pendingBurn(), 20);
+        assertEq(imd.balanceOf(destinations[0]), 0);
+        vm.expectRevert(IMDPumpRevenueSplitter.NothingToDistribute.selector);
+        vm.prank(stranger);
+        splitter.distribute();
+        vm.prank(stranger);
+        splitter.burnPending();
+        assertEq(imd.balanceOf(destinations[0]), 20);
         assertEq(splitter.totalBurned(), 20);
         assertEq(splitter.totalToDeveloper(), 65);
         assertEq(splitter.pendingBurn(), 0);
+        assertEq(imd.balanceOf(address(splitter)), 0);
     }
 
     function test_burnPendingDoesNotConsumeNewUnallocatedRevenue() public {
         imd.mint(address(splitter), 100);
         splitter.distribute();
+        _setSink(splitter); // nothing waiting: only the sink is written
+        assertEq(splitter.pendingBurn(), 20);
+        assertEq(splitter.totalBurned(), 0);
         imd.mint(address(splitter), 37);
-        _setSink(splitter);
         vm.prank(stranger);
         splitter.burnPending();
         assertEq(splitter.totalDistributed(), 100);
@@ -285,24 +295,140 @@ contract IMDPumpRevenuePropertiesTest is Test {
         assertEq(splitter.pendingOwner(), address(0));
     }
 
-    function test_renouncingConfiguredOwnershipClearsNomineeAndLeavesPublicDistributionLive() public {
+    function test_renounceIsRefusedAndLeavesOwnerNomineeAndDistributionIntact() public {
         _setSink(splitter);
         vm.startPrank(OWNER);
         splitter.transferOwnership(operator);
+        vm.expectRevert(IMDPumpRevenueSplitter.RenounceDisabled.selector);
         splitter.renounceOwnership();
         vm.stopPrank();
-        assertEq(splitter.owner(), address(0));
-        assertEq(splitter.pendingOwner(), address(0));
+        assertEq(splitter.owner(), OWNER);
+        assertEq(splitter.pendingOwner(), operator);
+        // The pending nominee cannot renounce either: it is not the owner yet.
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, operator));
         vm.prank(operator);
+        splitter.renounceOwnership();
+        vm.prank(operator);
         splitter.acceptOwnership();
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, OWNER));
-        vm.prank(OWNER);
-        splitter.setAllocation(10_000, 0, 0, 0, 0);
+        vm.expectRevert(IMDPumpRevenueSplitter.RenounceDisabled.selector);
+        vm.prank(operator);
+        splitter.renounceOwnership();
+        assertEq(splitter.owner(), operator);
         imd.mint(address(splitter), 100);
         vm.prank(stranger);
         assertEq(splitter.distribute(), 100);
         assertEq(imd.balanceOf(destinations[0]), 20);
+    }
+
+    function test_everySetterSettlesWaitingRevenueToTheOldTermsEvenWhenUnchanged() public {
+        for (uint256 action; action < 6; ++action) {
+            MockIMD token = new MockIMD();
+            IMDPumpRevenueSplitter s = _newSplitter(address(token));
+            _setSink(s);
+            token.mint(address(s), 1_000);
+            bytes memory data = _setterCall(s, action, makeAddr("setter target"));
+            vm.expectEmit(address(s));
+            emit IMDPumpRevenueSplitter.RevenueDistributed(OWNER, 1_000, 200, 150, 250, 200, 200);
+            vm.prank(OWNER);
+            (bool ok,) = address(s).call(data);
+            assertTrue(ok);
+            uint256[5] memory expected = [uint256(200), 150, 250, 200, 200];
+            for (uint256 i; i < 5; ++i) {
+                assertEq(token.balanceOf(destinations[i]), expected[i]);
+            }
+            assertEq(token.balanceOf(address(s)), 0);
+            assertEq(s.totalDistributed(), 1_000);
+            // A second call with nothing waiting distributes nothing and still succeeds.
+            vm.recordLogs();
+            vm.prank(OWNER);
+            (ok,) = address(s).call(data);
+            assertTrue(ok);
+            assertEq(vm.getRecordedLogs().length, 1, "only the setter's own event");
+            assertEq(s.totalDistributed(), 1_000);
+        }
+    }
+
+    function test_rejectedSetterInputDoesNotSettleWaitingRevenue() public {
+        imd.mint(address(splitter), 100);
+        bytes32 beforeConfig = _configuration(splitter);
+        bytes32 beforeAccounting = _accounting(splitter, imd);
+        vm.startPrank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(IMDPumpRevenueSplitter.InvalidAllocation.selector, 9_999));
+        splitter.setAllocation(2_000, 1_500, 2_500, 2_000, 1_999);
+        vm.expectRevert(IMDPumpRevenueSplitter.ZeroAddress.selector);
+        splitter.setDeveloper(address(0));
+        vm.expectRevert(IMDPumpRevenueSplitter.SelfRecipient.selector);
+        splitter.setBurnSink(address(splitter));
+        vm.stopPrank();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        vm.prank(stranger);
+        splitter.setTreasury(stranger);
+        assertEq(_configuration(splitter), beforeConfig);
+        assertEq(_accounting(splitter, imd), beforeAccounting);
+        assertEq(splitter.undistributedRevenue(), 100);
+    }
+
+    function test_strangerDustCannotRedirectASettingChangeAndIsPaidUnderOldTerms() public {
+        // A third party front-runs the owner's re-point with a one-wei donation: the dust is
+        // settled to the old treasury and the new treasury receives only later revenue.
+        address newTreasury = makeAddr("new treasury");
+        imd.mint(stranger, 1);
+        vm.prank(stranger);
+        imd.transfer(address(splitter), 1);
+        vm.prank(OWNER);
+        splitter.setTreasury(newTreasury);
+        assertEq(imd.balanceOf(destinations[2]), 1);
+        assertEq(imd.balanceOf(newTreasury), 0);
+        imd.mint(address(splitter), 100);
+        splitter.distribute();
+        assertEq(imd.balanceOf(newTreasury), 25);
+        assertEq(imd.balanceOf(destinations[2]), 1);
+    }
+
+    function test_setterSettlementCannotBeReenteredByThePayoutToken() public {
+        for (uint256 reentry; reentry < 4; ++reentry) {
+            CallbackRevenueToken callbackToken = new CallbackRevenueToken();
+            IMDPumpRevenueSplitter s = _newSplitter(address(callbackToken));
+            _setSink(s);
+            callbackToken.mint(address(s), 100);
+            bytes memory data = reentry == 0
+                ? abi.encodeCall(s.distribute, ())
+                : reentry == 1
+                    ? abi.encodeCall(s.burnPending, ())
+                    : reentry == 2
+                        ? abi.encodeCall(s.setDeveloper, (stranger))
+                        : abi.encodeCall(s.depositAndDistribute, (1));
+            callbackToken.configure(address(s), data, false, false);
+            vm.prank(OWNER);
+            s.setAllocation(0, 10_000, 0, 0, 0);
+            assertGt(callbackToken.callbackCount(), 0, "the callback must actually have run");
+            assertFalse(callbackToken.callbackSucceeded());
+            assertEq(
+                callbackToken.callbackResult(),
+                abi.encodeWithSelector(ReentrancyGuard.ReentrancyGuardReentrantCall.selector)
+            );
+            assertEq(s.totalDistributed(), 100);
+            assertEq(s.totalBurned(), 20);
+            assertEq(s.totalToDeveloper(), 15);
+            (address dev,,,) = s.recipients();
+            assertEq(dev, destinations[1]);
+            (, uint16 developerBps,,,) = s.allocation();
+            assertEq(developerBps, 10_000);
+            assertEq(callbackToken.balanceOf(address(s)), 0);
+        }
+    }
+
+    function _setterCall(IMDPumpRevenueSplitter s, uint256 action, address account)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        if (action == 0) return abi.encodeCall(s.setAllocation, (0, 0, 10_000, 0, 0));
+        if (action == 1) return abi.encodeCall(s.setDeveloper, (account));
+        if (action == 2) return abi.encodeCall(s.setTreasury, (account));
+        if (action == 3) return abi.encodeCall(s.setOperations, (account));
+        if (action == 4) return abi.encodeCall(s.setNftWorkers, (account));
+        return abi.encodeCall(s.setBurnSink, (account));
     }
 
     function test_noReturnCurrencySupportsPullDeferredBurnAndLaterFlush() public {
@@ -495,9 +621,12 @@ contract IMDPumpRevenuePropertiesTest is Test {
             for (uint256 reentry; reentry < 3; ++reentry) {
                 CallbackRevenueToken callbackToken = new CallbackRevenueToken();
                 IMDPumpRevenueSplitter s = _newSplitter(address(callbackToken));
-                callbackToken.mint(address(s), 100);
-                if (phase == 2) s.distribute();
+                if (phase == 2) {
+                    callbackToken.mint(address(s), 100);
+                    s.distribute();
+                }
                 _setSink(s);
+                if (phase != 2) callbackToken.mint(address(s), 100);
                 bytes memory data = reentry == 0
                     ? abi.encodeCall(s.distribute, ())
                     : reentry == 1 ? abi.encodeCall(s.depositAndDistribute, (1)) : abi.encodeCall(s.burnPending, ());

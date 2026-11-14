@@ -174,4 +174,28 @@ contract IMDPumpWalletGasTest is WalletGas {
         assertEq(imd.balanceOf(sink), 1);
         assertEq(splitter.totalBurned(), 1);
     }
+
+    /// @dev Setters settle waiting revenue before writing, through the same SafeERC20 payouts.
+    function test_walletGas_settersSettleWaitingRevenue() public {
+        imd.mint(address(splitter), 100e18);
+        address nextTreasury = makeAddr("wallet next treasury");
+        assertSameAtWalletGas(OWNER, address(splitter), abi.encodeCall(splitter.setTreasury, (nextTreasury)));
+        assertEq(splitter.totalDistributed(), 0, "helper must restore state");
+        assertSameAtWalletGas(OWNER, address(splitter), abi.encodeCall(splitter.setBurnSink, (sink)));
+        assertSameAtWalletGas(
+            OWNER, address(splitter), abi.encodeCall(splitter.setAllocation, (2_500, 1_500, 2_500, 2_000, 1_500))
+        );
+        vm.prank(OWNER);
+        splitter.setBurnSink(sink);
+        assertEq(imd.balanceOf(treasury), 25e18);
+        assertEq(splitter.pendingBurn(), 20e18, "the waiting burn share accrues before the sink is written");
+        // With a sink in force and revenue waiting, the settlement also flushes the old burn.
+        imd.mint(address(splitter), 100e18);
+        assertSameAtWalletGas(OWNER, address(splitter), abi.encodeCall(splitter.setTreasury, (nextTreasury)));
+        vm.prank(OWNER);
+        splitter.setTreasury(nextTreasury);
+        assertEq(imd.balanceOf(sink), 40e18);
+        assertEq(imd.balanceOf(treasury), 50e18);
+        assertEq(imd.balanceOf(nextTreasury), 0);
+    }
 }

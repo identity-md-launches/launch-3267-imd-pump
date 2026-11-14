@@ -34,6 +34,7 @@ contract IMDPumpRevenueHandler is Test {
     uint256 public expectedDeveloper;
     uint256 public strayInjected;
     uint256 public strayRecovered;
+    uint256 public settlements;
     bool public violation;
 
     constructor(MockIMD imd_, MockIMD stray_) {
@@ -127,7 +128,7 @@ contract IMDPumpRevenueHandler is Test {
     }
 
     function configure(uint256 action, uint256 seed, uint16[4] memory inputs) public {
-        action %= 6;
+        action %= 7;
         if (action == 0) {
             uint16[5] memory next;
             uint256 remaining = 10_000;
@@ -136,11 +137,8 @@ contract IMDPumpRevenueHandler is Test {
                 remaining -= next[i];
             }
             next[4] = uint16(remaining);
-            if (!_succeeds(
-                    expectedOwner,
-                    abi.encodeCall(splitter.setAllocation, (next[0], next[1], next[2], next[3], next[4])),
-                    ""
-                )) return;
+            if (!_setterSucceeds(abi.encodeCall(splitter.setAllocation, (next[0], next[1], next[2], next[3], next[4]))))
+            return;
             rates = next;
         } else if (action == 1) {
             uint256 bucket = 1 + seed % 4;
@@ -151,10 +149,10 @@ contract IMDPumpRevenueHandler is Test {
             else if (bucket == 2) data = abi.encodeCall(splitter.setTreasury, (account));
             else if (bucket == 3) data = abi.encodeCall(splitter.setOperations, (account));
             else data = abi.encodeCall(splitter.setNftWorkers, (account));
-            if (_succeeds(expectedOwner, data, "")) choices[bucket] = choice;
+            if (_setterSucceeds(data)) choices[bucket] = choice;
         } else if (action == 2) {
             uint256 choice = seed % 2;
-            if (!_succeeds(expectedOwner, abi.encodeCall(splitter.setBurnSink, (accounts[choice])), "")) return;
+            if (!_setterSucceeds(abi.encodeCall(splitter.setBurnSink, (accounts[choice])))) return;
             choices[0] = choice;
             sinkConfigured = true;
         } else if (action == 3) {
@@ -174,8 +172,34 @@ contract IMDPumpRevenueHandler is Test {
                 expectedOwner = expectedPendingOwner;
                 expectedPendingOwner = address(0);
             }
+        } else if (action == 5) {
+            // The owner can never renounce: an ownerless splitter could not name a burn sink.
+            _rejects(
+                expectedOwner,
+                abi.encodeCall(splitter.renounceOwnership, ()),
+                abi.encodeWithSelector(IMDPumpRevenueSplitter.RenounceDisabled.selector)
+            );
         } else if (_succeeds(expectedOwner, abi.encodeCall(splitter.transferOwnership, (address(0))), "")) {
             expectedPendingOwner = address(0);
+        }
+    }
+
+    /// @dev A setter first distributes revenue already waiting under the settings in force before
+    /// it, so the credits are checked against the old rates, recipients and sink, which the caller
+    /// only updates after this returns.
+    function _setterSucceeds(bytes memory data) private returns (bool ok) {
+        uint256 revenue = unallocated;
+        uint256[10] memory beforeBalances = _balances();
+        ok = _succeeds(expectedOwner, data, "");
+        if (!ok) return false;
+        if (revenue > 0) {
+            ++settlements;
+            _afterDistribution(revenue, beforeBalances);
+        } else {
+            // Nothing waiting: the setter moves no revenue and flushes no pending burn.
+            for (uint256 bucket; bucket < 5; ++bucket) {
+                _checkCredits(beforeBalances, bucket, 0);
+            }
         }
     }
 
