@@ -23,13 +23,22 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 /// transfer to the burn destination the owner configures with {setBurnSink}. Until that is set,
 /// the burn share is held here and recorded in {pendingBurn}; every other share is paid out
 /// immediately. Once the sink is set, {burnPending} (or the next {distribute}) sends everything
-/// accumulated. Every burn emits {BurnExecuted} with the amount and destination so it can be
-/// verified on chain.
+/// accumulated, including the share that accrued before the sink was named. Every burn emits
+/// {BurnExecuted} with the amount and destination. That record proves a transfer to the configured
+/// sink, not that the sink is a burn address: whoever verifies a burn checks the sink in
+/// {BurnSinkUpdated} and {BurnExecuted} against the address the IMD project recognises as its
+/// burn address.
 ///
 /// Trust assumptions: the owner (the requester) can change the allocation, the four recipient
 /// addresses and the burn sink, each through an event-emitting setter. The owner cannot touch
-/// IMD PUMP holders' balances or any revenue already paid out; it can only re-point future
-/// flows. The owner can recover tokens other than IMD that were sent here by mistake.
+/// IMD PUMP holders' balances or any revenue already paid out. Every setter first distributes any
+/// revenue already waiting here under the terms in force when it arrived, so a setting change
+/// applies only to revenue delivered after it; a change and a permissionless {distribute} cannot
+/// race over the same revenue. The one exception is {pendingBurn}: it is held until the owner
+/// names the burn sink, so the sink the owner names receives it. Ownership moves only in two
+/// steps; {renounceOwnership} is disabled because an ownerless splitter could never have its burn
+/// sink set, stranding the burn share forever. The owner can recover tokens other than IMD that
+/// were sent here by mistake.
 contract IMDPumpRevenueSplitter is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -113,6 +122,7 @@ contract IMDPumpRevenueSplitter is Ownable2Step, ReentrancyGuard {
     error BurnSinkNotConfigured();
     error RevenueTokenNotRecoverable();
     error ZeroAmount();
+    error RenounceDisabled();
 
     /// @param owner_ The launch owner: the requester. Never the factory.
     /// @param payout_ The address that initially receives every paid-out share (developer,
@@ -196,18 +206,24 @@ contract IMDPumpRevenueSplitter is Ownable2Step, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
     // Owner settings
     // ---------------------------------------------------------------------------------------------
+    // Every setter settles revenue that is already waiting before it writes, so revenue delivered
+    // under the old allocation and recipients is paid under them, and only later revenue follows
+    // the new setting. Without this, a setter and a permissionless {distribute} would race in the
+    // mempool over whatever was in flight.
 
     /// @notice Replaces the allocation. The five shares must sum to exactly {BPS}.
-    /// @dev Meant for the sustainability review the requester plans after three months.
+    /// @dev Meant for the sustainability review the requester plans after three months. Revenue
+    /// already waiting is distributed under the old allocation first.
     function setAllocation(
         uint16 burnBps,
         uint16 developerBps,
         uint16 treasuryBps,
         uint16 operationsBps,
         uint16 nftWorkersBps
-    ) external onlyOwner {
+    ) external nonReentrant onlyOwner {
         uint256 sum = uint256(burnBps) + developerBps + treasuryBps + operationsBps + nftWorkersBps;
         if (sum != BPS) revert InvalidAllocation(sum);
+        _settleWaitingRevenue();
         allocation = Allocation({
             burnBps: burnBps,
             developerBps: developerBps,
@@ -218,42 +234,64 @@ contract IMDPumpRevenueSplitter is Ownable2Step, ReentrancyGuard {
         emit AllocationUpdated(burnBps, developerBps, treasuryBps, operationsBps, nftWorkersBps);
     }
 
-    /// @notice Re-points the developer rewards recipient.
-    function setDeveloper(address account) external onlyOwner {
+    /// @notice Re-points the developer rewards recipient. Revenue already waiting is paid to the
+    /// previous recipient first.
+    function setDeveloper(address account) external nonReentrant onlyOwner {
         _checkRecipient(account);
+        _settleWaitingRevenue();
         emit DeveloperUpdated(recipients.developer, account);
         recipients.developer = account;
     }
 
-    /// @notice Re-points the IMD ecosystem treasury recipient.
-    function setTreasury(address account) external onlyOwner {
+    /// @notice Re-points the IMD ecosystem treasury recipient. Revenue already waiting is paid to
+    /// the previous recipient first.
+    function setTreasury(address account) external nonReentrant onlyOwner {
         _checkRecipient(account);
+        _settleWaitingRevenue();
         emit TreasuryUpdated(recipients.treasury, account);
         recipients.treasury = account;
     }
 
-    /// @notice Re-points the development and operations recipient.
-    function setOperations(address account) external onlyOwner {
+    /// @notice Re-points the development and operations recipient. Revenue already waiting is
+    /// paid to the previous recipient first.
+    function setOperations(address account) external nonReentrant onlyOwner {
         _checkRecipient(account);
+        _settleWaitingRevenue();
         emit OperationsUpdated(recipients.operations, account);
         recipients.operations = account;
     }
 
-    /// @notice Re-points the IMD NFT worker rewards recipient.
-    function setNftWorkers(address account) external onlyOwner {
+    /// @notice Re-points the IMD NFT worker rewards recipient. Revenue already waiting is paid to
+    /// the previous recipient first.
+    function setNftWorkers(address account) external nonReentrant onlyOwner {
         _checkRecipient(account);
+        _settleWaitingRevenue();
         emit NftWorkersUpdated(recipients.nftWorkers, account);
         recipients.nftWorkers = account;
     }
 
-    /// @notice Sets the destination that counts as a verified IMD burn.
+    /// @notice Sets the destination the burn share is sent to.
     /// @dev Required before any burn share leaves this contract. The IMD token has no burn
-    /// function, so the IMD project's recognised burn address is what belongs here.
-    function setBurnSink(address sink) external onlyOwner {
+    /// function, so the IMD project's recognised burn address is what belongs here. The owner
+    /// chooses this address: {pendingBurn}, including everything that accrued while the sink was
+    /// unset, goes to whatever sink is configured when it is flushed, and {BurnExecuted} records
+    /// that destination so anyone can check it is a genuine burn address. Revenue already waiting
+    /// is distributed first, so its burn share follows the previous sink (or joins {pendingBurn}
+    /// if none was set).
+    function setBurnSink(address sink) external nonReentrant onlyOwner {
         if (sink == address(0)) revert ZeroAddress();
         if (sink == address(this)) revert SelfRecipient();
+        _settleWaitingRevenue();
         emit BurnSinkUpdated(burnSink, sink);
         burnSink = sink;
+    }
+
+    /// @notice Disabled. Ownership moves only through {transferOwnership} and {acceptOwnership}.
+    /// @dev An ownerless splitter could never have {burnSink} set or corrected, which would strand
+    /// the burn share of all past and future revenue in this contract, and could never change the
+    /// allocation or the recipients again.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     /// @notice Recovers a token other than IMD that was sent here by mistake.
@@ -301,6 +339,11 @@ contract IMDPumpRevenueSplitter is Ownable2Step, ReentrancyGuard {
             if (burnSink != address(0)) _executeBurn();
             else emit BurnDeferred(pendingBurn);
         }
+    }
+
+    /// @dev Distributes revenue already waiting, if any, so a setting change never applies to it.
+    function _settleWaitingRevenue() private {
+        if (undistributedRevenue() > 0) _distribute();
     }
 
     function _executeBurn() private {

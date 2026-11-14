@@ -436,6 +436,177 @@ contract IMDPumpRevenueSplitterTest is Test {
         assertEq(splitter.owner(), newOwner);
     }
 
+    function test_renounceOwnershipIsDisabledWhileBurnSinkUnset() public {
+        _fund(100e18);
+        splitter.distribute();
+        assertEq(splitter.pendingBurn(), 20e18);
+        assertEq(splitter.burnSink(), address(0));
+
+        vm.prank(owner);
+        vm.expectRevert(IMDPumpRevenueSplitter.RenounceDisabled.selector);
+        splitter.renounceOwnership();
+
+        assertEq(splitter.owner(), owner, "the owner keeps the power to set the burn sink");
+        vm.prank(owner);
+        splitter.setBurnSink(sink);
+        splitter.burnPending();
+        assertEq(imd.balanceOf(sink), 20e18, "the burn share is never stranded");
+    }
+
+    function test_renounceOwnershipIsDisabledEvenWithBurnSinkSet() public {
+        vm.prank(owner);
+        splitter.setBurnSink(sink);
+        vm.prank(owner);
+        vm.expectRevert(IMDPumpRevenueSplitter.RenounceDisabled.selector);
+        splitter.renounceOwnership();
+        assertEq(splitter.owner(), owner);
+    }
+
+    function test_renounceOwnershipRefusesStrangers() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        splitter.renounceOwnership();
+    }
+
+    // ------------------------------------------------------------------- setters settle revenue first
+
+    function test_setAllocationSettlesWaitingRevenueUnderTheOldSplit() public {
+        _pointRecipientsApart();
+        _fund(1_000e18);
+        assertEq(splitter.undistributedRevenue(), 1_000e18);
+
+        vm.expectEmit(address(splitter));
+        emit IMDPumpRevenueSplitter.RevenueDistributed(owner, 1_000e18, 200e18, 150e18, 250e18, 200e18, 200e18);
+        vm.expectEmit(address(splitter));
+        emit IMDPumpRevenueSplitter.AllocationUpdated(2_000, 500, 3_500, 2_000, 2_000);
+        vm.prank(owner);
+        splitter.setAllocation(2_000, 500, 3_500, 2_000, 2_000);
+
+        assertEq(splitter.undistributedRevenue(), 0, "nothing delivered under the old split is left to re-split");
+        assertEq(imd.balanceOf(developer), 150e18, "the developer gets 15% of what was earned at 15%");
+        assertEq(imd.balanceOf(treasury), 250e18);
+
+        // A front-running distribute() has nothing left to take, and later revenue follows the cut.
+        vm.prank(developer);
+        vm.expectRevert(IMDPumpRevenueSplitter.NothingToDistribute.selector);
+        splitter.distribute();
+        _fund(1_000e18);
+        splitter.distribute();
+        assertEq(imd.balanceOf(developer), 200e18, "150 + 50 under the new 5% share");
+        assertEq(imd.balanceOf(treasury), 600e18, "250 + 350 under the new 35% share");
+    }
+
+    function test_setDeveloperSettlesWaitingRevenueToThePreviousDeveloper() public {
+        _pointRecipientsApart();
+        _fund(1_000e18);
+        address newDeveloper = makeAddr("newDeveloper");
+
+        vm.prank(owner);
+        splitter.setDeveloper(newDeveloper);
+
+        assertEq(splitter.undistributedRevenue(), 0);
+        assertEq(imd.balanceOf(developer), 150e18, "revenue earned while D was the recipient goes to D");
+        assertEq(imd.balanceOf(newDeveloper), 0);
+        _fund(1_000e18);
+        splitter.distribute();
+        assertEq(imd.balanceOf(newDeveloper), 150e18, "later revenue goes to the new recipient");
+        assertEq(imd.balanceOf(developer), 150e18);
+    }
+
+    function test_everyRecipientSetterSettlesWaitingRevenueFirst() public {
+        _pointRecipientsApart();
+        address replacement = makeAddr("replacement");
+
+        _fund(100e18);
+        vm.prank(owner);
+        splitter.setTreasury(replacement);
+        assertEq(imd.balanceOf(treasury), 25e18);
+
+        _fund(100e18);
+        vm.prank(owner);
+        splitter.setOperations(replacement);
+        assertEq(imd.balanceOf(operations), 40e18);
+
+        _fund(100e18);
+        vm.prank(owner);
+        splitter.setNftWorkers(replacement);
+        assertEq(imd.balanceOf(nftWorkers), 60e18);
+
+        // The replacement is treasury from the second delivery on (25 of the second 100) and
+        // treasury plus operations from the third (25 + 20): never anything earned before it was named.
+        assertEq(imd.balanceOf(replacement), 25e18 + 45e18, "the replacement only receives what it was named for");
+        assertEq(splitter.undistributedRevenue(), 0);
+        assertEq(splitter.totalDistributed(), 300e18);
+    }
+
+    function test_setBurnSinkSettlesWaitingRevenueUnderThePreviousSink() public {
+        address oldSink = makeAddr("oldSink");
+        vm.prank(owner);
+        splitter.setBurnSink(oldSink);
+        _fund(100e18);
+
+        vm.prank(owner);
+        splitter.setBurnSink(sink);
+
+        assertEq(imd.balanceOf(oldSink), 20e18, "the burn share of revenue already waiting follows the old sink");
+        assertEq(imd.balanceOf(sink), 0);
+        assertEq(splitter.undistributedRevenue(), 0);
+    }
+
+    function test_setBurnSinkWithNoPreviousSinkKeepsTheWaitingBurnSharePending() public {
+        _fund(100e18);
+        vm.prank(owner);
+        splitter.setBurnSink(sink);
+        // The waiting revenue was settled with the sink unset, so its burn share joins pendingBurn
+        // and leaves on the next burnPending(), to the sink the owner has now named.
+        assertEq(imd.balanceOf(payout), 80e18);
+        assertEq(splitter.pendingBurn(), 20e18);
+        splitter.burnPending();
+        assertEq(imd.balanceOf(sink), 20e18);
+    }
+
+    function test_settersWithNothingWaitingDistributeNothing() public {
+        _fund(100e18);
+        splitter.distribute();
+        assertEq(splitter.totalDistributed(), 100e18);
+
+        vm.recordLogs();
+        vm.startPrank(owner);
+        splitter.setAllocation(2_500, 1_500, 2_500, 2_000, 1_500);
+        splitter.setDeveloper(developer);
+        splitter.setTreasury(treasury);
+        splitter.setOperations(operations);
+        splitter.setNftWorkers(nftWorkers);
+        splitter.setBurnSink(sink);
+        vm.stopPrank();
+
+        assertEq(vm.getRecordedLogs().length, 6, "one event per setter, no distribution");
+        assertEq(splitter.totalDistributed(), 100e18);
+        assertEq(splitter.pendingBurn(), 20e18, "pendingBurn is not touched by setters");
+    }
+
+    function test_setterSettlementIsReentrancyGuarded() public {
+        ReentrantToken evil = new ReentrantToken();
+        IMDPumpRevenueSplitter target = new IMDPumpRevenueSplitter(owner, payout, address(evil));
+        evil.setTarget(IReenterTarget(address(target)));
+        evil.mint(address(target), 100e18);
+
+        vm.prank(owner);
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        target.setDeveloper(developer);
+        assertEq(evil.balanceOf(address(target)), 100e18, "nothing moved");
+        (address dev,,,) = target.recipients();
+        assertEq(dev, payout, "the setting did not change");
+    }
+
+    function test_invalidAllocationIsRefusedBeforeSettling() public {
+        _fund(100e18);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(IMDPumpRevenueSplitter.InvalidAllocation.selector, 9_999));
+        splitter.setAllocation(2_000, 1_500, 2_500, 2_000, 1_999);
+        assertEq(splitter.undistributedRevenue(), 100e18, "a rejected setter changes nothing");
+    }
+
     // ------------------------------------------------------------------------------ recovery
 
     function test_recoverStrayToken() public {

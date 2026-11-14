@@ -55,6 +55,12 @@ Flow:
 reverts with `NothingToDistribute` when no new revenue has arrived; `burnPending()` reverts with
 `BurnSinkNotConfigured` until the sink is set and `NothingToBurn` when nothing is pending.
 
+Every owner setter (`setAllocation`, the four recipient setters and `setBurnSink`) first distributes
+any revenue already waiting in the contract under the allocation, recipients and sink in force when
+it arrived, then writes the new value. A setting therefore applies only to revenue delivered after
+it, whatever order the operator's delivery, a third party's `distribute()` and the owner's setter
+land in. With nothing waiting, a setter only writes and emits its event.
+
 ## Assumptions
 
 - **Revenue is delivered in IMD.** The brief describes SOL revenue funding "IMD purchases" on
@@ -66,10 +72,16 @@ reverts with `NothingToDistribute` when no new revenue has arrived; `burnPending
   receives; it cannot verify that what it receives is the correct net figure.
 - **IMD has no burn function.** The IMD token at the address above exposes `transfer`,
   `transferFrom`, `allowance`, `totalSupply` and `owner`, but no `burn(uint256)` or `burnFrom`
-  (checked against its deployed bytecode on 2026-11-14). A "verified burn" is therefore a transfer to
-  a burn destination the owner configures. This destination is deliberately not hard-coded: the
-  IMD project knows which address it treats as its burn address, and the contract refuses to invent
-  one. Until it is set, the burn share is held and never lost.
+  (checked against its deployed bytecode on 2026-11-14; its verified source is a LayerZero OFT with
+  plain OpenZeppelin ERC-20 transfers, no blacklist, pause or transfer fee). A "burn" is therefore a
+  transfer to a burn destination the owner configures. This destination is deliberately not
+  hard-coded: the IMD project knows which address it treats as its burn address, and the contract
+  refuses to invent one. Until it is set, the burn share is held as `pendingBurn` and never lost.
+  `BurnExecuted(sink, amount)` and `totalBurned` record transfers to the configured sink; they do
+  not by themselves prove the sink is a burn address. Anyone verifying the burn programme checks the
+  sink in `BurnSinkUpdated` and `BurnExecuted` against the IMD project's recognised burn address.
+  The owner chooses the sink, so the owner could name any address, including its own; that is a
+  trust assumption on the requester, stated below, not something the contract can rule out.
 - **One payout address.** The brief names a single recipient for fees and payouts, so all four
   paid-out buckets start there. The split is still computed and emitted per bucket so the owner can
   re-point treasury, operations, NFT worker and developer flows separately later.
@@ -109,32 +121,46 @@ The owner (the requester) configures the splitter through event-emitting setters
 
 | Setting | Setter | Set it to | Where it comes from |
 | --- | --- | --- | --- |
-| Burn destination | `setBurnSink(address)` | The address the IMD project treats as its verified IMD burn address | The IMD project. Required before any burn share leaves the splitter; until then the share accrues in `pendingBurn`. |
+| Burn destination | `setBurnSink(address)` | The address the IMD project treats as its verified IMD burn address | The IMD project. Required before any burn share leaves the splitter; until then the share accrues in `pendingBurn`, and the sink named first receives everything accrued so far. |
 | Developer rewards recipient | `setDeveloper(address)` | The developer's wallet | Starts at the payout address |
 | Treasury recipient | `setTreasury(address)` | The IMD ecosystem treasury | Starts at the payout address |
 | Operations recipient | `setOperations(address)` | The development and operations wallet | Starts at the payout address |
 | NFT worker rewards recipient | `setNftWorkers(address)` | The wallet or contract that pays NFT workers | Starts at the payout address |
 | Allocation | `setAllocation(burn, developer, treasury, operations, nftWorkers)` | Basis points summing to 10,000 | The three-month sustainability review. Launch values: 2000, 1500, 2500, 2000, 2000. |
 
-Setters refuse the zero address and the splitter's own address. Ownership moves in two steps
-(`transferOwnership` then `acceptOwnership` by the new owner).
+Setters refuse the zero address and the splitter's own address, and each one settles revenue already
+waiting before it writes (see Flow above). Ownership moves in two steps only (`transferOwnership`
+then `acceptOwnership` by the new owner). `renounceOwnership` is disabled and reverts with
+`RenounceDisabled`: an ownerless splitter could never have its burn sink set or corrected, which
+would strand the burn share of all past and future revenue, and could never adjust the allocation
+after the sustainability review.
 
 ## Operational responsibilities
 
 - **Operator:** compute eligible net platform revenue per period, convert it to IMD, deposit it and
   call `distribute()` (or use `depositAndDistribute`). Publish the figures alongside the
   `RevenueDistributed` events so the community can reconcile them.
-- **Owner:** set the burn sink promptly after launch so the 20% burn share starts leaving the
-  contract; keep recipient addresses current; run the sustainability review and, if the split
-  changes, announce it before calling `setAllocation`. Use a multisig for the owner key.
+- **Owner:** set the burn sink promptly after launch, to the IMD project's recognised burn address,
+  so the 20% burn share starts leaving the contract; keep recipient addresses current; run the
+  sustainability review and announce any new split before calling `setAllocation`. The setters
+  settle waiting revenue under the old terms themselves, so no manual `distribute()` is needed
+  first. Use a multisig for the owner key, and never try to renounce it (the call is disabled).
 - **Anyone:** may call `distribute()` and `burnPending()`. Neither can redirect funds.
 - **Recovery:** the owner can recover tokens other than IMD that were sent to the splitter by
   mistake with `recoverToken`. IMD can only leave through distribution and the burn.
 
 ## Trust assumptions and security notes
 
-- The owner can re-point future revenue flows and change the split. It cannot touch IMDPUMP
-  holders' balances, cannot mint, cannot pause the token, and cannot claw back revenue already paid.
+- The owner can re-point revenue flows and change the split for revenue delivered after the change.
+  It cannot touch IMDPUMP holders' balances, cannot mint, cannot pause the token, and cannot claw
+  back revenue already paid. Revenue already waiting in the splitter when a setter runs is paid
+  under the previous settings, so a setter and a permissionless `distribute()` cannot race over it.
+- The burn share is the exception: `pendingBurn` (the 20% share of every distribution made while the
+  sink was unset) is held until the owner names a sink and then goes to that sink. The owner
+  decides where already-accrued burn share goes, and the `BurnExecuted`/`totalBurned` record
+  attests the transfer to that owner-chosen destination. Verification that it is a genuine burn
+  rests on checking the sink address, not on the event alone.
+- Ownership cannot be renounced. Only a two-step transfer moves it.
 - A wrongly configured recipient or burn sink loses the IMD sent to it. Setters emit events so a
   mistake is visible before the next distribution.
 - All token movements use OpenZeppelin `SafeERC20`; `distribute`, `depositAndDistribute` and
@@ -158,6 +184,8 @@ v1.17.0; see each `VENDORED_VERSION`). Tests read no environment variables and p
 The test suite covers: token metadata, supply, untaxed transfers (fuzzed), allowance failures,
 self-burn and the absence of any admin surface; the splitter's constructor validation, the exact
 launch split, rounding, conservation of revenue under the launch and arbitrary allocations (fuzzed),
-deferred and immediate burns, every setter's success and failure path, two-step ownership, token
-recovery, ETH rejection, a reentrant revenue token and a non-standard (no bool return) token; and the
-deployment script's `deploy` function.
+deferred and immediate burns, every setter's success and failure path, setters settling waiting
+revenue under the old terms (and distributing nothing when nothing waits), reentrancy into a
+setter's settlement, two-step ownership, the disabled `renounceOwnership`, token recovery, ETH
+rejection, a reentrant revenue token and a non-standard (no bool return) token; and the deployment
+script's `deploy` function.
